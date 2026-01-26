@@ -24,29 +24,32 @@ fn main() {
 
 Grate-rs also provides the following helpers to avoid needless `unsafe` usage for common patterns:
 
-- ```rust
-pub fn register_handler(
-    cageid: u64,
-    syscall_nr: u64,
-    register_flag: u64,
-    grateid: u64,
-    handler: SyscallHandler,
-) -> Result<(), i32> 
-```
+- 
+    ```rust
+    pub fn register_handler(
+        cageid: u64,
+        syscall_nr: u64,
+        register_flag: u64,
+        grateid: u64,
+        handler: SyscallHandler,
+    ) -> Result<(), i32> 
+    ```
 
-- ```rust
-pub fn copy_data_between_cages(
-    thiscage: u64,
-    targetcage: u64,
-    srcaddr: u64,
-    srccage: u64,
-    destaddr: u64,
-    destcage: u64,
-    len: u64,
-    copytype: u64,
-) -> Result<(), i32>
-```
+- 
+    ```rust
+    pub fn copy_data_between_cages(
+        thiscage: u64,
+        targetcage: u64,
+        srcaddr: u64,
+        srccage: u64,
+        destaddr: u64,
+        destcage: u64,
+        len: u64,
+        copytype: u64,
+    ) -> Result<(), i32>
+    ```
 
-- ```rust
-pub fn getpid() -> i32
-```
+- 
+    ```rust
+    pub fn getpid() -> i32
+    ```
