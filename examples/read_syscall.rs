@@ -40,7 +40,10 @@ extern "C" fn read_syscall(
         thiscage, buf_cage, ptr as u64, thiscage, buf, buf_cage, count, 0,
     ) {
         Ok(_) => ret,
-        Err(v) => v,
+        Err(e) => {
+            eprintln!("copy_data_between_cages failed: {:?}", e);
+            -1
+        }
     }
 }
 
@@ -50,9 +53,15 @@ fn main() {
         .register(0, read_syscall)
         .cage_init(|| println!("[cage_init] Code to run post-fork but pre-exec"));
 
-    builder.run();
-
-    println!(
-        "[grate_teardown] Code that runs after the child exits. Run dump_file() or similar things"
-    );
+    match builder.run() {
+        Ok(_) => {
+            println!(
+                "[grate_teardown] Code that runs after the child exits. Run dump_file() or similar things"
+            );
+        }
+        Err(e) => {
+            eprintln!("[grate_error] Failed to run grate: {:?}", e);
+            std::process::exit(1);
+        }
+    }
 }

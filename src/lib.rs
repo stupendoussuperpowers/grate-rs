@@ -1,10 +1,20 @@
 use core::ffi::{c_char, c_int};
 use libc::{EXIT_FAILURE, perror, pid_t};
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::{env, ptr};
 
 const ELINDAPIABORTED: u64 = 0xE001_0001;
+
+/// Error types that can occur during grate execution
+#[derive(Debug)]
+pub enum GrateError {
+    PipeError(i32),
+    ForkError(i32),
+    ExecvError(i32),
+    HandlerRegistrationError(i32),
+    CopyDataError(i32),
+}
 
 /// The signature of a syscall handler function
 pub type SyscallHandler = extern "C" fn(
@@ -53,6 +63,7 @@ unsafe extern "C" {
     fn fork() -> pid_t;
     fn execv(prog: *const c_char, argv: *const *mut c_char) -> c_int;
     fn waitpid(pid: pid_t, status: *mut c_int, options: c_int) -> pid_t;
+    fn pipe(fds: *mut c_int) -> c_int;
 }
 
 // Wrap register_handler, copy_data_between_cages, and getpid to be more Rust-native.
@@ -66,7 +77,7 @@ pub fn register_handler(
     register_flag: u64,
     grateid: u64,
     handler: SyscallHandler,
-) -> Result<(), i32> {
+) -> Result<(), GrateError> {
     let fn_ptr_addr = handler as *const () as usize as u64;
 
     let ret = unsafe {
@@ -80,7 +91,7 @@ pub fn register_handler(
     };
 
     if ret != 0 {
-        return Err(ret as i32);
+        return Err(GrateError::HandlerRegistrationError(ret as i32));
     }
 
     Ok(())
@@ -95,7 +106,7 @@ pub fn copy_data_between_cages(
     destcage: u64,
     len: u64,
     copytype: u64,
-) -> Result<(), i32> {
+) -> Result<(), GrateError> {
     let ret = unsafe {
         cp_data_impl(
             thiscage, targetcage, srcaddr, srccage, destaddr, destcage, len, copytype,
@@ -103,7 +114,11 @@ pub fn copy_data_between_cages(
     };
 
     if ret == ELINDAPIABORTED as i32 {
-        return Err(-1);
+        return Err(GrateError::CopyDataError(-1));
+    }
+
+    if ret != 0 {
+        return Err(GrateError::CopyDataError(ret));
     }
 
     Ok(())
@@ -197,7 +212,7 @@ impl GrateBuilder {
     // Build and run the grate.
     //
     // This is the equivalent of the fork-exec we perform in the main function of C grates.
-    pub fn run(self) {
+    pub fn run(self) -> Result<(), GrateError> {
         let argv: Vec<String> = env::args().collect();
         if argv.len() < 2 {
             eprintln!("Usage: {} <program> [args...]", argv[0]);
@@ -207,21 +222,28 @@ impl GrateBuilder {
         unsafe {
             let grateid: pid_t = getpid();
 
-            let pid: pid_t = fork();
-            if pid < 0 {
+            let mut fds = [0; 2];
+            if pipe(fds.as_mut_ptr()) != 0 {
+                perror(b"pipe failed\0".as_ptr() as *const _);
+                return Err(GrateError::PipeError(EXIT_FAILURE));
+            }
+
+            let read_fd = fds[0];
+            let write_fd = fds[1];
+
+            let cageid: pid_t = fork();
+            if cageid < 0 {
                 perror(b"fork failed\0".as_ptr() as *const _);
-                libc::_exit(EXIT_FAILURE);
-            } else if pid == 0 {
-                let cageid = getpid() as u64;
+                return Err(GrateError::ForkError(EXIT_FAILURE));
+            } else if cageid == 0 {
+                libc::close(write_fd);
+
+                let mut buf: u8 = 0;
+                libc::read(read_fd, &mut buf as *mut u8 as *mut c_void, 1);
+
+                libc::close(read_fd);
 
                 // Register all handlers
-                for (syscall_nr, handler) in &self.handlers {
-                    match register_handler(cageid, *syscall_nr, 1, grateid as u64, *handler) {
-                        Ok(_) => {}
-                        Err(_ret) => libc::_exit(EXIT_FAILURE),
-                    };
-                }
-
                 // Run pre-exec callback if provided
                 if let Some(callback) = self.cage_init {
                     callback();
@@ -242,12 +264,26 @@ impl GrateBuilder {
                 execv(path.as_ptr(), c_argv.as_ptr());
 
                 perror(b"execv failed\0".as_ptr() as *const _);
-                libc::_exit(EXIT_FAILURE);
+                return Err(GrateError::ExecvError(EXIT_FAILURE));
             } else {
-                waitpid(pid, ptr::null_mut(), 0);
-                return;
-                // libc::_exit(0);
+                libc::close(read_fd);
+
+                for (syscall_nr, handler) in &self.handlers {
+                    match register_handler(cageid as u64, *syscall_nr, 1, grateid as u64, *handler)
+                    {
+                        Ok(_) => {}
+                        Err(ret) => return Err(ret),
+                    };
+                }
+
+                let signal: u8 = 1;
+                libc::write(write_fd, &signal as *const u8 as *const c_void, 1);
+
+                libc::close(write_fd);
+
+                waitpid(cageid, ptr::null_mut(), 0);
             }
         }
+        Ok(())
     }
 }
