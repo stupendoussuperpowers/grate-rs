@@ -54,9 +54,9 @@ fn main() {
         .cage_init(|| println!("[cage_init] Code to run post-fork but pre-exec"));
 
     match builder.run() {
-        Ok(_) => {
+        Ok(status) => {
             println!(
-                "[grate_teardown] Code that runs after the child exits. Run dump_file() or similar things"
+                "[grate_teardown] Cage exited with: {status}. Run dump_file() or similar things"
             );
         }
         Err(e) => {

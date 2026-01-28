@@ -1,6 +1,5 @@
 use core::ffi::{c_char, c_int};
 use libc::{EXIT_FAILURE, perror, pid_t};
-use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 use std::{env, ptr};
 
@@ -117,10 +116,6 @@ pub fn copy_data_between_cages(
         return Err(GrateError::CopyDataError(-1));
     }
 
-    if ret != 0 {
-        return Err(GrateError::CopyDataError(ret));
-    }
-
     Ok(())
 }
 
@@ -181,22 +176,24 @@ pub type CageInitCallback = Box<dyn FnOnce()>;
 
 /// A builder for creating grates with customizable lifecycle hooks
 pub struct GrateBuilder {
-    handlers: HashMap<u64, SyscallHandler>,
+    handlers: Vec<(u64, SyscallHandler)>,
     cage_init: Option<CageInitCallback>,
+    cage_status: i32,
 }
 
 impl GrateBuilder {
     /// Create a new grate builder
     pub fn new() -> Self {
         Self {
-            handlers: HashMap::new(),
+            handlers: Vec::new(),
             cage_init: None,
+            cage_status: -1,
         }
     }
 
     /// Register a syscall handler
     pub fn register(mut self, syscall_nr: u64, handler: SyscallHandler) -> Self {
-        self.handlers.insert(syscall_nr, handler);
+        self.handlers.push((syscall_nr, handler));
         self
     }
 
@@ -212,7 +209,7 @@ impl GrateBuilder {
     // Build and run the grate.
     //
     // This is the equivalent of the fork-exec we perform in the main function of C grates.
-    pub fn run(self) -> Result<(), GrateError> {
+    pub fn run(mut self) -> Result<i32, GrateError> {
         let argv: Vec<String> = env::args().collect();
         if argv.len() < 2 {
             eprintln!("Usage: {} <program> [args...]", argv[0]);
@@ -265,25 +262,28 @@ impl GrateBuilder {
 
                 perror(b"execv failed\0".as_ptr() as *const _);
                 return Err(GrateError::ExecvError(EXIT_FAILURE));
-            } else {
-                libc::close(read_fd);
-
-                for (syscall_nr, handler) in &self.handlers {
-                    match register_handler(cageid as u64, *syscall_nr, 1, grateid as u64, *handler)
-                    {
-                        Ok(_) => {}
-                        Err(ret) => return Err(ret),
-                    };
-                }
-
-                let signal: u8 = 1;
-                libc::write(write_fd, &signal as *const u8 as *const c_void, 1);
-
-                libc::close(write_fd);
-
-                waitpid(cageid, ptr::null_mut(), 0);
             }
+
+            libc::close(read_fd);
+
+            for (syscall_nr, handler) in &self.handlers {
+                match register_handler(cageid as u64, *syscall_nr, 1, grateid as u64, *handler) {
+                    Ok(_) => {}
+                    Err(ret) => return Err(ret),
+                };
+            }
+
+            let signal: u8 = 1;
+            libc::write(write_fd, &signal as *const u8 as *const c_void, 1);
+
+            libc::close(write_fd);
+
+            let mut status: i32 = 0;
+            waitpid(cageid, &mut status as *mut i32 as *mut c_int, 0);
+
+            self.cage_status = status;
         }
-        Ok(())
+
+        Ok(self.cage_status)
     }
 }
