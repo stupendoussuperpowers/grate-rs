@@ -1,4 +1,4 @@
-use grate_rs::{GrateBuilder, copy_data_between_cages, getpid};
+use grate_rs::{GrateBuilder, copy_data_between_cages, getcageid};
 use std::cmp::min;
 
 fn imfs_read(_cageid: u64, _fd: u64, buf: &mut [u8], count: usize) -> i32 {
@@ -26,7 +26,7 @@ extern "C" fn read_syscall(
     _arg6: u64,
     _arg6cage: u64,
 ) -> i32 {
-    let thiscage = getpid() as u64;
+    let thiscage = getcageid();
 
     // Equivalent to malloc(count)
     let mut buffer = vec![0u8; count as usize];

@@ -1,16 +1,30 @@
 use core::ffi::{c_char, c_int};
-use libc::{EXIT_FAILURE, perror, pid_t};
+use libc::{close, pid_t, read, write};
 use std::ffi::{CString, c_void};
 use std::{env, ptr};
 
 const ELINDAPIABORTED: u64 = 0xE001_0001;
 
-/// Error types that can occur during grate execution
+macro_rules! call_sys {
+    ($fn:ident ( $($arg:expr),* $(,)? )) => {{
+        let ret = $fn($($arg),*);
+
+        if ret < 0 {
+            Err(GrateError::CoordinationError(
+                concat!(stringify!($fn),
+                " failed:",
+                stringify!(ret))
+            ))
+        } else {
+            Ok(ret)
+        }
+    }}
+}
+
+// Error types that can occur during grate execution
 #[derive(Debug)]
 pub enum GrateError {
-    PipeError(i32),
-    ForkError(i32),
-    ExecvError(i32),
+    CoordinationError(&'static str),
     HandlerRegistrationError(i32),
     CopyDataError(i32),
 }
@@ -89,11 +103,10 @@ pub fn register_handler(
         )
     };
 
-    if ret != 0 {
-        return Err(GrateError::HandlerRegistrationError(ret as i32));
+    match ret {
+        0 => Err(GrateError::HandlerRegistrationError(ret)),
+        _ => Ok(()),
     }
-
-    Ok(())
 }
 
 pub fn copy_data_between_cages(
@@ -112,15 +125,14 @@ pub fn copy_data_between_cages(
         )
     };
 
-    if ret == ELINDAPIABORTED as i32 {
-        return Err(GrateError::CopyDataError(-1));
+    match ret as u64 {
+        ELINDAPIABORTED => Err(GrateError::CopyDataError(ELINDAPIABORTED as i32)),
+        _ => Ok(()),
     }
-
-    Ok(())
 }
 
-pub fn getpid() -> i32 {
-    unsafe { getpid_impl() }
+pub fn getcageid() -> u64 {
+    unsafe { getpid_impl() as u64 }
 }
 
 // This function is required by threei to dispatch registered syscalls to this grate.
@@ -217,71 +229,70 @@ impl GrateBuilder {
         }
 
         unsafe {
-            let grateid: pid_t = getpid();
+            let grateid = getcageid();
 
             let mut fds = [0; 2];
-            if pipe(fds.as_mut_ptr()) != 0 {
-                perror(b"pipe failed\0".as_ptr() as *const _);
-                return Err(GrateError::PipeError(EXIT_FAILURE));
-            }
+            let _ = call_sys!(pipe(fds.as_mut_ptr()));
 
             let read_fd = fds[0];
             let write_fd = fds[1];
 
-            let cageid: pid_t = fork();
-            if cageid < 0 {
-                perror(b"fork failed\0".as_ptr() as *const _);
-                return Err(GrateError::ForkError(EXIT_FAILURE));
-            } else if cageid == 0 {
-                libc::close(write_fd);
+            match call_sys!(fork())? {
+                0 => {
+                    let _ = call_sys!(close(write_fd));
 
-                let mut buf: u8 = 0;
-                libc::read(read_fd, &mut buf as *mut u8 as *mut c_void, 1);
+                    let mut buf: u8 = 0;
+                    let _ = call_sys!(read(read_fd, &mut buf as *mut u8 as *mut c_void, 1));
 
-                libc::close(read_fd);
+                    let _ = call_sys!(close(read_fd));
 
-                // Register all handlers
-                // Run pre-exec callback if provided
-                if let Some(callback) = self.cage_init {
-                    callback();
+                    // Register all handlers
+                    // Run pre-exec callback if provided
+                    if let Some(callback) = self.cage_init {
+                        callback();
+                    }
+
+                    // Prepare arguments for execv
+                    let mut cstrings: Vec<CString> = argv[1..]
+                        .iter()
+                        .map(|s| CString::new(s.as_str()).unwrap())
+                        .collect();
+
+                    let mut c_argv: Vec<*mut i8> =
+                        cstrings.iter_mut().map(|s| s.as_ptr() as *mut i8).collect();
+
+                    c_argv.push(ptr::null_mut());
+
+                    let path = CString::new(argv[1].as_str()).unwrap();
+
+                    let _ = call_sys!(execv(path.as_ptr(), c_argv.as_ptr()));
                 }
+                cageid => {
+                    let _ = call_sys!(close(read_fd));
+                    for (syscall_nr, handler) in &self.handlers {
+                        match register_handler(
+                            cageid as u64,
+                            *syscall_nr,
+                            1,
+                            grateid as u64,
+                            *handler,
+                        ) {
+                            Ok(_) => {}
+                            Err(ret) => return Err(ret),
+                        };
+                    }
 
-                // Prepare arguments for execv
-                let mut cstrings: Vec<CString> = argv[1..]
-                    .iter()
-                    .map(|s| CString::new(s.as_str()).unwrap())
-                    .collect();
+                    let signal: u8 = 1;
+                    let _ = call_sys!(write(write_fd, &signal as *const u8 as *const c_void, 1));
 
-                let mut c_argv: Vec<*mut i8> =
-                    cstrings.iter_mut().map(|s| s.as_ptr() as *mut i8).collect();
+                    let _ = call_sys!(close(write_fd));
 
-                c_argv.push(ptr::null_mut());
+                    let mut status: i32 = 0;
+                    let _ = call_sys!(waitpid(cageid, &mut status as *mut i32 as *mut c_int, 0));
 
-                let path = CString::new(argv[1].as_str()).unwrap();
-                execv(path.as_ptr(), c_argv.as_ptr());
-
-                perror(b"execv failed\0".as_ptr() as *const _);
-                return Err(GrateError::ExecvError(EXIT_FAILURE));
+                    self.cage_status = status;
+                }
             }
-
-            libc::close(read_fd);
-
-            for (syscall_nr, handler) in &self.handlers {
-                match register_handler(cageid as u64, *syscall_nr, 1, grateid as u64, *handler) {
-                    Ok(_) => {}
-                    Err(ret) => return Err(ret),
-                };
-            }
-
-            let signal: u8 = 1;
-            libc::write(write_fd, &signal as *const u8 as *const c_void, 1);
-
-            libc::close(write_fd);
-
-            let mut status: i32 = 0;
-            waitpid(cageid, &mut status as *mut i32 as *mut c_int, 0);
-
-            self.cage_status = status;
         }
 
         Ok(self.cage_status)
