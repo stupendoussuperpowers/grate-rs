@@ -232,19 +232,19 @@ impl GrateBuilder {
             let grateid = getcageid();
 
             let mut fds = [0; 2];
-            let _ = call_sys!(pipe(fds.as_mut_ptr()));
+            let _ = call_sys!(pipe(fds.as_mut_ptr()))?;
 
             let read_fd = fds[0];
             let write_fd = fds[1];
 
             match call_sys!(fork())? {
                 0 => {
-                    let _ = call_sys!(close(write_fd));
+                    let _ = call_sys!(close(write_fd))?;
 
                     let mut buf: u8 = 0;
-                    let _ = call_sys!(read(read_fd, &mut buf as *mut u8 as *mut c_void, 1));
+                    let _ = call_sys!(read(read_fd, &mut buf as *mut u8 as *mut c_void, 1))?;
 
-                    let _ = call_sys!(close(read_fd));
+                    let _ = call_sys!(close(read_fd))?;
 
                     // Register all handlers
                     // Run pre-exec callback if provided
@@ -265,7 +265,7 @@ impl GrateBuilder {
 
                     let path = CString::new(argv[1].as_str()).unwrap();
 
-                    let _ = call_sys!(execv(path.as_ptr(), c_argv.as_ptr()));
+                    let _ = call_sys!(execv(path.as_ptr(), c_argv.as_ptr()))?;
                 }
                 cageid => {
                     let _ = call_sys!(close(read_fd));
@@ -283,12 +283,12 @@ impl GrateBuilder {
                     }
 
                     let signal: u8 = 1;
-                    let _ = call_sys!(write(write_fd, &signal as *const u8 as *const c_void, 1));
+                    let _ = call_sys!(write(write_fd, &signal as *const u8 as *const c_void, 1))?;
 
-                    let _ = call_sys!(close(write_fd));
+                    let _ = call_sys!(close(write_fd))?;
 
                     let mut status: i32 = 0;
-                    let _ = call_sys!(waitpid(cageid, &mut status as *mut i32 as *mut c_int, 0));
+                    let _ = call_sys!(waitpid(cageid, &mut status as *mut i32 as *mut c_int, 0))?;
 
                     self.cage_status = status;
                 }
