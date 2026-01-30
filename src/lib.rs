@@ -5,27 +5,42 @@ use std::{env, ptr};
 
 const ELINDAPIABORTED: u64 = 0xE001_0001;
 
+/// Wrapper macro for calling libc functions/syscalls with error handling.
+///
+/// ### Usage:
+///     let result: Result<i32, GrateError> = call_sys!(function_name(..args..));
+///
+/// ### Returns:
+///     Err(GrateError::CoordinationError) // if the function returns < 0
+///     Ok(ret) // otherwise
 macro_rules! call_sys {
     ($fn:ident ( $($arg:expr),* $(,)? )) => {{
         let ret = $fn($($arg),*);
 
         if ret < 0 {
+            let err = std::io::Error::last_os_error();
             Err(GrateError::CoordinationError(
-                concat!(stringify!($fn),
-                " failed:",
-                stringify!(ret))
+                format!(
+                    "{} failed: {}",
+                    stringify!($fn),
+                    err,
+                )
             ))
         } else {
+            println!("syscall return {}: {ret}", stringify!($fn));
             Ok(ret)
         }
     }}
 }
 
-// Error types that can occur during grate execution
+/// Error types that can occur during grate execution.
 #[derive(Debug)]
 pub enum GrateError {
-    CoordinationError(&'static str),
+    /// OS errors that occur during setup.
+    CoordinationError(String),
+    /// Error returned by `register_handler`.
     HandlerRegistrationError(i32),
+    /// Error returned by `copy_data_between_cages`.
     CopyDataError(i32),
 }
 
@@ -47,8 +62,7 @@ pub type SyscallHandler = extern "C" fn(
 ) -> i32;
 
 unsafe extern "C" {
-    // Since we wrap these functions, we need them to have a different name in the rust context.
-    // Using link_name to ensure they are mapped to correct sysroot entities.
+    /// External function bindings. We use `link_name` to map Rust names to their sysroot equivalents.
     #[link_name = "register_handler"]
     fn register_handler_impl(
         cageid: u64,
@@ -84,6 +98,8 @@ unsafe extern "C" {
 // This allows us to use these functions without needing a myriad of unsafe blocks.
 //
 // Also sticks to the familiar syntax of Result<V, E> return types for these.
+
+/// Register Handler for a syscall for a source cage to the the target grate.
 pub fn register_handler(
     cageid: u64,
     syscall_nr: u64,
@@ -104,11 +120,12 @@ pub fn register_handler(
     };
 
     match ret {
-        0 => Err(GrateError::HandlerRegistrationError(ret)),
-        _ => Ok(()),
+        0 => Ok(()),
+        _ => Err(GrateError::HandlerRegistrationError(ret)),
     }
 }
 
+/// Copy data between two cages.
 pub fn copy_data_between_cages(
     thiscage: u64,
     targetcage: u64,
@@ -131,12 +148,12 @@ pub fn copy_data_between_cages(
     }
 }
 
+/// Get the current cage ID.
 pub fn getcageid() -> u64 {
     unsafe { getpid_impl() as u64 }
 }
 
-// This function is required by threei to dispatch registered syscalls to this grate.
-// We need no_mangle and extern "C" to ensure it's named correctly.
+/// Dispatch function required by 3i to invoke registered syscall handlers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pass_fptr_to_wt(
     fn_ptr_uint: u64,
@@ -155,7 +172,7 @@ pub unsafe extern "C" fn pass_fptr_to_wt(
     arg6cage: u64,
 ) -> c_int {
     if fn_ptr_uint == 0 {
-        println!("[grate] invalid function pointer");
+        eprintln!("[grate] invalid function pointer");
         return -1;
     }
 
@@ -194,7 +211,7 @@ pub struct GrateBuilder {
 }
 
 impl GrateBuilder {
-    /// Create a new grate builder
+    /// Create a empty grate builder
     pub fn new() -> Self {
         Self {
             handlers: Vec::new(),
@@ -209,7 +226,7 @@ impl GrateBuilder {
         self
     }
 
-    /// Set a callback to run before exec (in child process, after handler registration)
+    /// Set a callback to run before exec (in child process)
     pub fn cage_init<F>(mut self, callback: F) -> Self
     where
         F: FnOnce() + 'static,
@@ -218,9 +235,13 @@ impl GrateBuilder {
         self
     }
 
-    // Build and run the grate.
-    //
-    // This is the equivalent of the fork-exec we perform in the main function of C grates.
+    /// Build and run the grate.
+    ///
+    /// This spawns a child cage process and registers handlers in the parent grate process.
+    /// 
+    /// ### Returns
+    ///     Err(GrateError) // On failure.
+    ///     Ok(i32) // Cage exit status.
     pub fn run(mut self) -> Result<i32, GrateError> {
         let argv: Vec<String> = env::args().collect();
         if argv.len() < 2 {
@@ -231,6 +252,7 @@ impl GrateBuilder {
         unsafe {
             let grateid = getcageid();
 
+            // Use pipes to synchronize grate-cage lifecycles.
             let mut fds = [0; 2];
             let _ = call_sys!(pipe(fds.as_mut_ptr()))?;
 
@@ -239,14 +261,15 @@ impl GrateBuilder {
 
             match call_sys!(fork())? {
                 0 => {
+                    // Child process - will become the cage.
                     let _ = call_sys!(close(write_fd))?;
 
+                    // Wait for a ready signal from the grate before setting up and executing the cage.
                     let mut buf: u8 = 0;
                     let _ = call_sys!(read(read_fd, &mut buf as *mut u8 as *mut c_void, 1))?;
 
                     let _ = call_sys!(close(read_fd))?;
 
-                    // Register all handlers
                     // Run pre-exec callback if provided
                     if let Some(callback) = self.cage_init {
                         callback();
@@ -268,7 +291,11 @@ impl GrateBuilder {
                     let _ = call_sys!(execv(path.as_ptr(), c_argv.as_ptr()))?;
                 }
                 cageid => {
+                    // Parent process - the grate handler.
+
                     let _ = call_sys!(close(read_fd));
+
+                    // Register handlers with 3i.
                     for (syscall_nr, handler) in &self.handlers {
                         match register_handler(
                             cageid as u64,
@@ -282,11 +309,13 @@ impl GrateBuilder {
                         };
                     }
 
+                    // Signal the cage process that handler registration is complete.
                     let signal: u8 = 1;
                     let _ = call_sys!(write(write_fd, &signal as *const u8 as *const c_void, 1))?;
 
                     let _ = call_sys!(close(write_fd))?;
 
+                    // Wait for the cage process to exit and retrieve its status code.
                     let mut status: i32 = 0;
                     let _ = call_sys!(waitpid(cageid, &mut status as *mut i32 as *mut c_int, 0))?;
 
@@ -294,7 +323,8 @@ impl GrateBuilder {
                 }
             }
         }
-
+        
+        // Return the status code of the exiting cage.
         Ok(self.cage_status)
     }
 }
