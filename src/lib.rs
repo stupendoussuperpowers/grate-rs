@@ -27,7 +27,6 @@ macro_rules! call_sys {
                 )
             ))
         } else {
-            println!("syscall return {}: {ret}", stringify!($fn));
             Ok(ret)
         }
     }}
